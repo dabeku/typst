@@ -9,12 +9,12 @@
 
 = Introduction
 
-#include "chapters/introduction.typ"
+#include "introduction.typ"
 
 = Methods
 
-#include "chapters/methods.typ"
+#include "methods.typ"
 
 = Conclusion
 
-#include "chapters/conclusion.typ"
+#include "conclusion.typ"

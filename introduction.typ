@@ -3,6 +3,6 @@ This is the introduction.
 Here is some *emphasized* text.
 
 #figure(
-  image("typst_256.png", width: 80%),
+  image("ai-future.png", width: 60%),
   caption: [Project architecture.]
 )

@@ -3,6 +3,6 @@ This is the introduction.
 Here is some *emphasized* text.
 
 #figure(
-  image("../figures/architecture.png", width: 80%),
+  image("typst_256.png", width: 80%),
   caption: [Project architecture.]
 )

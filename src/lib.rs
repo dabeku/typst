@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
-use typst::diag::{FileError, FileResult, SourceDiagnostic};
+use typst::diag::{FileError, FileResult, PackageError, SourceDiagnostic};
 use typst::foundations::{Bytes, Datetime};
-use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
+use typst::syntax::ast::{self, AstNode};
+use typst::syntax::package::PackageSpec;
+use typst::syntax::{FileId, RootedPath, Source, SyntaxNode, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
@@ -47,6 +49,15 @@ fn vpath_to_path_buf(id: FileId) -> PathBuf {
 /// disk, so an editor's unsaved buffers can be compiled as-is. Only binary
 /// resources referenced by path but absent from `texts` (images, etc.) are
 /// read from `root` on disk, if set.
+///
+/// Package files (`@namespace/name:version/...`, including a package's own
+/// `typst.toml` and `.typ` sources) are never looked up in `texts`; they are
+/// always read from `package_cache_dir`, laid out as
+/// `{namespace}/{name}/{version}/...` — the same layout the app is
+/// responsible for downloading packages into. If the package's version
+/// directory isn't present there, this reports `FileError::Package(
+/// PackageError::NotFound)` so the caller can distinguish "go download this
+/// package" from an ordinary missing-file error.
 struct TypstWorld {
     library: LazyHash<Library>,
     book: LazyHash<FontBook>,
@@ -54,13 +65,19 @@ struct TypstWorld {
     main_id: FileId,
     texts: HashMap<FileId, String>,
     root: Option<PathBuf>,
+    package_cache_dir: Option<PathBuf>,
     now: time::OffsetDateTime,
     source_cache: Mutex<HashMap<FileId, Source>>,
     resource_cache: Mutex<HashMap<FileId, FileResult<Bytes>>>,
 }
 
 impl TypstWorld {
-    fn new(main_id: FileId, texts: HashMap<FileId, String>, root: Option<PathBuf>) -> Self {
+    fn new(
+        main_id: FileId,
+        texts: HashMap<FileId, String>,
+        root: Option<PathBuf>,
+        package_cache_dir: Option<PathBuf>,
+    ) -> Self {
         let fonts = FONTS.clone();
         let book = FontBook::from_fonts(&fonts);
         Self {
@@ -70,16 +87,17 @@ impl TypstWorld {
             main_id,
             texts,
             root,
+            package_cache_dir,
             now: time::OffsetDateTime::now_utc(),
             source_cache: Mutex::new(HashMap::new()),
             resource_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Reads the raw bytes of a binary resource (e.g. an image) from disk,
-    /// relative to `root`. Caches the result so a resource referenced
-    /// multiple times only touches disk once and stays consistent within
-    /// this compile.
+    /// Reads the raw bytes of a resource (an image, a package's `typst.toml`,
+    /// a package's `.typ` sources, ...) from disk. Caches the result so a
+    /// resource referenced multiple times only touches disk once and stays
+    /// consistent within this compile.
     fn read_resource(&self, id: FileId) -> FileResult<Bytes> {
         if let Some(cached) = self.resource_cache.lock().unwrap().get(&id) {
             return cached.clone();
@@ -90,16 +108,27 @@ impl TypstWorld {
     }
 
     fn read_resource_from_disk(&self, id: FileId) -> FileResult<Bytes> {
-        let Some(root) = &self.root else {
+        let rooted = id.get();
+        let base = match rooted.root() {
+            VirtualRoot::Project => self.root.clone(),
+            VirtualRoot::Package(spec) => {
+                let Some(cache_dir) = &self.package_cache_dir else {
+                    return Err(FileError::Package(PackageError::NotFound(spec.clone())));
+                };
+                let package_dir = cache_dir
+                    .join(spec.namespace.as_str())
+                    .join(spec.name.as_str())
+                    .join(spec.version.to_string());
+                if !package_dir.is_dir() {
+                    return Err(FileError::Package(PackageError::NotFound(spec.clone())));
+                }
+                Some(package_dir)
+            }
+        };
+        let Some(base) = base else {
             return Err(FileError::NotFound(vpath_to_path_buf(id)));
         };
-        let rooted = id.get();
-        if !matches!(rooted.root(), VirtualRoot::Project) {
-            return Err(FileError::Other(Some(
-                "package imports are not supported".into(),
-            )));
-        }
-        let path = rooted.vpath().realize(root)?;
+        let path = rooted.vpath().realize(&base)?;
         let bytes = std::fs::read(&path).map_err(|e| FileError::from_io(e, &path))?;
         Ok(Bytes::new(bytes))
     }
@@ -122,11 +151,20 @@ impl World for TypstWorld {
         if let Some(cached) = self.source_cache.lock().unwrap().get(&id) {
             return Ok(cached.clone());
         }
-        let text = self
-            .texts
-            .get(&id)
-            .ok_or_else(|| FileError::NotFound(vpath_to_path_buf(id)))?;
-        let source = Source::new(id, text.clone());
+        let text = if let Some(text) = self.texts.get(&id) {
+            text.clone()
+        } else if matches!(id.get().root(), VirtualRoot::Package(_)) {
+            // Package sources (unlike project sources) are never supplied
+            // via `texts` — they always come from the on-disk package cache.
+            let bytes = self.read_resource(id)?;
+            bytes
+                .as_str()
+                .map_err(|_| FileError::InvalidUtf8)?
+                .to_string()
+        } else {
+            return Err(FileError::NotFound(vpath_to_path_buf(id)));
+        };
+        let source = Source::new(id, text);
         self.source_cache.lock().unwrap().insert(id, source.clone());
         Ok(source)
     }
@@ -173,7 +211,7 @@ fn compile_with(world: TypstWorld) -> Result<Vec<u8>, TypstError> {
 #[uniffi::export]
 pub fn compile_to_pdf(source: String) -> Result<Vec<u8>, TypstError> {
     let main_id = intern_path("main.typ").expect("the literal path \"main.typ\" is always valid");
-    let world = TypstWorld::new(main_id, HashMap::from([(main_id, source)]), None);
+    let world = TypstWorld::new(main_id, HashMap::from([(main_id, source)]), None, None);
     compile_with(world)
 }
 
@@ -187,11 +225,20 @@ pub fn compile_to_pdf(source: String) -> Result<Vec<u8>, TypstError> {
 ///
 /// `root_dir` is only consulted for binary resources referenced by path but
 /// not present in `sources` — e.g. `#image("logo.png")` — which must exist
-/// there on disk. Package imports (`#import "@preview/..."`) are not
-/// supported.
+/// there on disk.
+///
+/// `package_cache_dir`, if set, is where downloaded packages are expected to
+/// live, laid out as `{namespace}/{name}/{version}/...` (e.g.
+/// `preview/cetz/0.2.2/typst.toml`) — the app owns fetching and unpacking
+/// packages there; this function only ever reads from it. If an
+/// `#import`/`#include`d package isn't present under `package_cache_dir`
+/// (or `package_cache_dir` is `None`), compilation fails with a
+/// [`TypstError`] whose message names the missing package; use
+/// [`list_package_imports`] beforehand to know which packages to fetch.
 #[uniffi::export]
 pub fn compile_project_to_pdf(
     root_dir: String,
+    package_cache_dir: Option<String>,
     main_path: String,
     sources: HashMap<String, String>,
 ) -> Result<Vec<u8>, TypstError> {
@@ -208,8 +255,106 @@ pub fn compile_project_to_pdf(
         reason: format!("main_path {main_path:?} is missing from sources"),
     })?;
 
-    let world = TypstWorld::new(main_id, texts, Some(PathBuf::from(root_dir)));
+    let world = TypstWorld::new(
+        main_id,
+        texts,
+        Some(PathBuf::from(root_dir)),
+        package_cache_dir.map(PathBuf::from),
+    );
     compile_with(world)
+}
+
+/// A package referenced by an `#import`/`#include` in a project, as found by
+/// [`list_package_imports`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct PackageRef {
+    pub namespace: String,
+    pub name: String,
+    pub version: String,
+}
+
+/// Scans `sources`, starting at `main_path`, for `#import`/`#include` of
+/// `@namespace/name:version` package paths, following local (non-package)
+/// imports transitively as long as their targets are present in `sources`.
+///
+/// This lets the app prefetch every package a project directly needs
+/// *before* calling [`compile_project_to_pdf`], instead of discovering them
+/// one at a time via compile failures. It's a static, best-effort scan:
+/// - Only literal string import paths are seen; a dynamically computed
+///   import path can't be resolved without running the compiler.
+/// - It doesn't look inside a package for *its own* dependencies — those
+///   are only knowable once that package is downloaded. A transitive
+///   dependency that's still missing surfaces as a normal
+///   [`TypstError`] from `compile_project_to_pdf` naming the missing
+///   package, so the app should still be ready to catch that and fetch
+///   on demand as a fallback.
+#[uniffi::export]
+pub fn list_package_imports(
+    main_path: String,
+    sources: HashMap<String, String>,
+) -> Result<Vec<PackageRef>, TypstError> {
+    let main_vpath = VirtualPath::new(&main_path).map_err(|e| TypstError::Compile {
+        reason: format!("invalid path {main_path:?}: {e}"),
+    })?;
+
+    let mut packages = Vec::new();
+    let mut seen_packages = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![main_vpath];
+
+    while let Some(vpath) = stack.pop() {
+        let key = vpath.get_without_slash().to_string();
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        let Some(text) = sources.get(&key) else {
+            continue;
+        };
+
+        let mut targets = Vec::new();
+        collect_import_targets(&typst::syntax::parse(text), &mut targets);
+
+        for target in targets {
+            if target.starts_with('@') {
+                let Ok(spec) = target.parse::<PackageSpec>() else {
+                    continue;
+                };
+                if seen_packages.insert(spec.clone()) {
+                    packages.push(PackageRef {
+                        namespace: spec.namespace.to_string(),
+                        name: spec.name.to_string(),
+                        version: spec.version.to_string(),
+                    });
+                }
+            } else {
+                let base = vpath
+                    .parent()
+                    .unwrap_or_else(|| VirtualPath::new("").expect("empty path is valid"));
+                if let Ok(joined) = base.join(&target) {
+                    stack.push(joined);
+                }
+            }
+        }
+    }
+
+    Ok(packages)
+}
+
+/// Collects the literal string source of every `#import`/`#include` in a
+/// syntax tree, in document order.
+fn collect_import_targets(node: &SyntaxNode, out: &mut Vec<String>) {
+    if let Some(import) = ast::ModuleImport::from_untyped(node) {
+        if let ast::Expr::Str(s) = import.source() {
+            out.push(s.get().to_string());
+        }
+    } else if let Some(include) = ast::ModuleInclude::from_untyped(node) {
+        if let ast::Expr::Str(s) = include.source() {
+            out.push(s.get().to_string());
+        }
+    }
+    for child in node.children() {
+        collect_import_targets(child, out);
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +409,7 @@ mod tests {
 
         let pdf = compile_project_to_pdf(
             dir.path().to_string_lossy().into_owned(),
+            None,
             "main.typ".to_string(),
             sources,
         )
@@ -286,6 +432,7 @@ mod tests {
 
         let pdf = compile_project_to_pdf(
             dir.path().to_string_lossy().into_owned(),
+            None,
             "main.typ".to_string(),
             sources,
         )
@@ -299,11 +446,108 @@ mod tests {
         let sources = HashMap::from([("other.typ".to_string(), "hi".to_string())]);
         let err = compile_project_to_pdf(
             dir.path().to_string_lossy().into_owned(),
+            None,
             "main.typ".to_string(),
             sources,
         )
         .unwrap_err();
         let TypstError::Compile { reason } = err;
         assert!(reason.contains("main_path"));
+    }
+
+    #[test]
+    fn project_compile_reports_missing_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "#import \"@preview/cetz:0.2.2\": canvas".to_string(),
+        )]);
+
+        let err = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            Some(cache_dir.path().to_string_lossy().into_owned()),
+            "main.typ".to_string(),
+            sources,
+        )
+        .unwrap_err();
+        let TypstError::Compile { reason } = err;
+        assert!(reason.contains("cetz"), "unexpected error: {reason}");
+    }
+
+    #[test]
+    fn project_compile_resolves_package_from_cache_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = cache_dir.path().join("preview").join("greet").join("0.1.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("typst.toml"),
+            "[package]\nname = \"greet\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("lib.typ"),
+            "#let hello = \"Hi from package\"",
+        )
+        .unwrap();
+
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "#import \"@preview/greet:0.1.0\": hello\n#hello".to_string(),
+        )]);
+
+        let pdf = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            Some(cache_dir.path().to_string_lossy().into_owned()),
+            "main.typ".to_string(),
+            sources,
+        )
+        .expect("project compilation should succeed");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn list_package_imports_finds_direct_and_transitive_imports() {
+        let sources = HashMap::from([
+            (
+                "main.typ".to_string(),
+                "#import \"@preview/cetz:0.2.2\": canvas\n#import \"chapters/intro.typ\": greeting"
+                    .to_string(),
+            ),
+            (
+                "chapters/intro.typ".to_string(),
+                "#import \"@preview/tablex:0.0.9\"\n#let greeting = \"hi\"".to_string(),
+            ),
+        ]);
+
+        let mut packages = list_package_imports("main.typ".to_string(), sources).unwrap();
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(
+            packages,
+            vec![
+                PackageRef {
+                    namespace: "preview".to_string(),
+                    name: "cetz".to_string(),
+                    version: "0.2.2".to_string(),
+                },
+                PackageRef {
+                    namespace: "preview".to_string(),
+                    name: "tablex".to_string(),
+                    version: "0.0.9".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_package_imports_ignores_missing_local_imports() {
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "#import \"does-not-exist.typ\": x".to_string(),
+        )]);
+        let packages = list_package_imports("main.typ".to_string(), sources).unwrap();
+        assert!(packages.is_empty());
     }
 }

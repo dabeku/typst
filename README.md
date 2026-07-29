@@ -1,6 +1,29 @@
-# TODO
+# Setup (mac)
 
-package imports (#import "@preview/...") are still not supported — only local files under root_dir.
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+sh -s -- -y --default-toolchain stable --profile minimal
+
+source "$HOME/.cargo/env"
+
+rustup component add rustfmt clippy
+
+rustup target add \
+ aarch64-linux-android \
+ armv7-linux-androideabi \
+ x86_64-linux-android \
+ i686-linux-android
+
+cargo install cargo-edit cargo-audit cargo-ndk
+
+rustc --version
+cargo --version
+cargo fmt --version
+cargo clippy --version
+cargo ndk --version
+cargo audit --version
+cargo set-version --version
+```
 
 # typst_uniffi
 
@@ -24,25 +47,64 @@ pub fn compile_to_pdf(source: String) -> Result<Vec<u8>, TypstError>;
 /// unsaved editor buffers work as-is. `main_path` (e.g. "main.typ") must be
 /// a key in `sources`. `root_dir` on disk is only consulted for binary
 /// resources referenced by path but absent from `sources`, e.g.
-/// `#image("logo.png")`. Package imports (`#import "@preview/..."`) are not
-/// supported.
+/// `#image("logo.png")`. `package_cache_dir`, if set, is where downloaded
+/// packages live (see "Package imports" below).
 pub fn compile_project_to_pdf(
     root_dir: String,
+    package_cache_dir: Option<String>,
     main_path: String,
     sources: std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, TypstError>;
+
+/// Scans `sources`, starting at `main_path`, for `#import`/`#include` of
+/// `@namespace/name:version` packages, following local imports
+/// transitively. Lets the app prefetch packages before compiling. See
+/// "Package imports" below.
+pub fn list_package_imports(
+    main_path: String,
+    sources: std::collections::HashMap<String, String>,
+) -> Result<Vec<PackageRef>, TypstError>;
+
+pub struct PackageRef {
+    pub namespace: String,
+    pub name: String,
+    pub version: String,
+}
 ```
 
 `TypstError::Compile { message }` is returned for both Typst syntax/compile
-errors and PDF export errors (including a missing/unreadable image, or a
-`main_path` absent from `sources`); `message` joins all diagnostics with
-`\n`.
+errors and PDF export errors (including a missing/unreadable image, an
+unresolved package, or a `main_path` absent from `sources`); `message` joins
+all diagnostics with `\n`.
 
 `compile_project_to_pdf` never touches disk for text files — every `.typ`
 and bibliography file the project needs must be an entry in `sources`. Only
 binary resources (images, etc.) not found in `sources` fall back to
 `root_dir` — e.g. an app-specific directory the Android app has saved
 resource files into (`context.getFilesDir()` or similar).
+
+### Package imports
+
+typst_uniffi never downloads packages itself — the app owns fetching and
+storing them; Rust only ever reads them back from disk. Workflow:
+
+1. Before compiling, call `list_package_imports(main_path, sources)` to get
+   every `@namespace/name:version` package the project directly imports or
+   includes (following local `.typ` imports transitively). This is a
+   static scan of literal import paths — it won't see dynamically computed
+   import paths, and it can't see a package's *own* dependencies (those are
+   only knowable once that package is downloaded).
+2. For each `PackageRef` not already cached, download and unpack it into
+   `package_cache_dir`, laid out as `{namespace}/{name}/{version}/...`
+   (e.g. `preview/cetz/0.2.2/typst.toml`, `preview/cetz/0.2.2/src/lib.typ`)
+   — the same layout typst-cli's own package cache uses, and typically
+   fetched by downloading and untarring
+   `https://packages.typst.org/{namespace}/{name}-{version}.tar.gz`.
+3. Call `compile_project_to_pdf(root_dir, Some(package_cache_dir), main_path,
+   sources)`. If a package the project needs still isn't present under
+   `package_cache_dir` — including a transitive dependency step 1 couldn't
+   see — compilation fails with a `TypstError` naming the missing package;
+   catch that, fetch it, and retry.
 
 ## Rebuilding
 
@@ -134,11 +196,34 @@ the Kotlin Gradle plugin is applied to the app module.
 
        byte[] pdf = Typst_uniffiKt.compileProjectToPdf(
            projectDir.getAbsolutePath(),
+           null, // no packages used, so no package cache needed
            "main.typ",
            sources
        );
    } catch (TypstException e) {
        // e.getMessage() contains the Typst diagnostics
+   }
+
+   // Project that imports a package — prefetch it into packageCacheDir
+   // first (download+unpack is entirely the app's job), then compile.
+   try {
+       Map<String, String> sources = new HashMap<>();
+       sources.put("main.typ", "#import \"@preview/cetz:0.2.2\": canvas\ncanvas(...)");
+
+       for (PackageRef pkg : Typst_uniffiKt.listPackageImports("main.typ", sources)) {
+           ensurePackageDownloaded(packageCacheDir, pkg.getNamespace(), pkg.getName(), pkg.getVersion());
+       }
+
+       byte[] pdf = Typst_uniffiKt.compileProjectToPdf(
+           projectDir.getAbsolutePath(),
+           packageCacheDir.getAbsolutePath(),
+           "main.typ",
+           sources
+       );
+   } catch (TypstException e) {
+       // e.getMessage() names the missing package if a transitive
+       // dependency wasn't caught by listPackageImports — fetch it and
+       // retry.
    }
    ```
 

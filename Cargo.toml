@@ -1,0 +1,29 @@
+[package]
+name = "typst_uniffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "typst_uniffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-library = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+time = "0.3"
+thiserror = "2"
+uniffi = { version = "0.32.0", features = ["cli"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

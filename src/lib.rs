@@ -215,10 +215,24 @@ fn format_diagnostics(diags: &[SourceDiagnostic]) -> String {
         .join("\n")
 }
 
+/// How many compiles a `comemo` cache entry may go unused before eviction
+/// (see [`compile_with`]).
+const EVICT_MAX_AGE: usize = 10;
+
 fn compile_with(world: TypstWorld) -> Result<Vec<u8>, TypstError> {
-    let document = typst::compile::<PagedDocument>(&world)
-        .output
-        .map_err(|diags| compile_error(&world, &diags))?;
+    let output = typst::compile::<PagedDocument>(&world).output;
+
+    // `comemo`'s memoization caches are process-global and keyed by content
+    // hash, not by `TypstWorld` instance — so a caller repeatedly compiling
+    // the same project (e.g. an editor's "watch" loop calling this on every
+    // edit) keeps benefiting from cached results for files it didn't touch,
+    // even though a fresh `TypstWorld` is built each call. Without eviction
+    // those caches would grow unboundedly over such a long-running session,
+    // so trim entries unused for the last `EVICT_MAX_AGE` compiles after
+    // every compile, same as `typst-cli`'s watch mode does.
+    comemo::evict(EVICT_MAX_AGE);
+
+    let document = output.map_err(|diags| compile_error(&world, &diags))?;
 
     typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
         .map_err(|diags| TypstError::Compile { reason: format_diagnostics(&diags) })
@@ -234,16 +248,6 @@ fn compile_error(world: &TypstWorld, diags: &[SourceDiagnostic]) -> TypstError {
         return TypstError::PackageNotFound { package: spec.into() };
     }
     TypstError::Compile { reason: format_diagnostics(diags) }
-}
-
-/// Compiles a single, self-contained Typst source string into a PDF.
-/// `#import`/`#image` of external files is not supported; use
-/// [`compile_project_to_pdf`] for multi-file projects.
-#[uniffi::export]
-pub fn compile_to_pdf(source: String) -> Result<Vec<u8>, TypstError> {
-    let main_id = intern_path("main.typ").expect("the literal path \"main.typ\" is always valid");
-    let world = TypstWorld::new(main_id, HashMap::from([(main_id, source)]), None, None);
-    compile_with(world)
 }
 
 /// Compiles a Typst project into a PDF.
@@ -400,15 +404,33 @@ mod tests {
 
     #[test]
     fn compiles_simple_document() {
-        let pdf = compile_to_pdf("= Hello\nThis is *Typst* running from Rust.".to_string())
-            .expect("compilation should succeed");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "= Hello\nThis is *Typst* running from Rust.".to_string(),
+        )]);
+        let pdf = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            "main.typ".to_string(),
+            sources,
+        )
+        .expect("compilation should succeed");
         assert!(pdf.starts_with(b"%PDF"));
         assert!(pdf.len() > 100);
     }
 
     #[test]
     fn reports_syntax_errors() {
-        let err = compile_to_pdf("#let x = ".to_string()).unwrap_err();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = HashMap::from([("main.typ".to_string(), "#let x = ".to_string())]);
+        let err = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            "main.typ".to_string(),
+            sources,
+        )
+        .unwrap_err();
         let TypstError::Compile { reason } = err else {
             panic!("expected TypstError::Compile, got {err:?}");
         };
@@ -416,8 +438,19 @@ mod tests {
     }
 
     #[test]
-    fn standalone_compile_rejects_imports() {
-        let err = compile_to_pdf("#import \"other.typ\": x".to_string()).unwrap_err();
+    fn project_compile_reports_missing_import_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "#import \"other.typ\": x".to_string(),
+        )]);
+        let err = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            "main.typ".to_string(),
+            sources,
+        )
+        .unwrap_err();
         let TypstError::Compile { reason } = err else {
             panic!("expected TypstError::Compile, got {err:?}");
         };

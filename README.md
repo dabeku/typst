@@ -32,15 +32,11 @@ Android (Java/Kotlin) via [UniFFI](https://mozilla.github.io/uniffi-rs/).
 
 The whole Typst compiler plus a set of embedded fonts (New Computer Modern,
 Libertinus Serif, DejaVu Sans Mono — same fonts `typst-cli` ships with) are
-statically linked into the `.so`, so both functions below work fully offline.
+statically linked into the `.so`, so the functions below work fully offline.
 
 ## API
 
 ```rust
-/// Single, self-contained source string. `#import`/`#image` of external
-/// files is NOT supported.
-pub fn compile_to_pdf(source: String) -> Result<Vec<u8>, TypstError>;
-
 /// Multi-file project. `sources` maps every project-relative *text* file
 /// path (main file, `#import`ed `.typ` files, bibliography `.bib`/`.yml`
 /// files, ...) to its live content — none of these are read from disk, so

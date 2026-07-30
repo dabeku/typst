@@ -70,12 +70,18 @@ pub struct PackageRef {
     pub name: String,
     pub version: String,
 }
-```
 
-`TypstError::Compile { message }` is returned for both Typst syntax/compile
-errors and PDF export errors (including a missing/unreadable image, an
-unresolved package, or a `main_path` absent from `sources`); `message` joins
-all diagnostics with `\n`.
+pub enum TypstError {
+    /// Typst syntax/compile errors, PDF export errors, a missing/unreadable
+    /// image, or a `main_path` absent from `sources`. `reason` joins all
+    /// diagnostics with `\n`.
+    Compile { reason: String },
+    /// Compilation needed a package that isn't present under
+    /// `package_cache_dir` (or no `package_cache_dir` was given). `package`
+    /// names exactly which one — download it and retry.
+    PackageNotFound { package: PackageRef },
+}
+```
 
 `compile_project_to_pdf` never touches disk for text files — every `.typ`
 and bibliography file the project needs must be an entry in `sources`. Only
@@ -103,8 +109,8 @@ storing them; Rust only ever reads them back from disk. Workflow:
 3. Call `compile_project_to_pdf(root_dir, Some(package_cache_dir), main_path,
    sources)`. If a package the project needs still isn't present under
    `package_cache_dir` — including a transitive dependency step 1 couldn't
-   see — compilation fails with a `TypstError` naming the missing package;
-   catch that, fetch it, and retry.
+   see — compilation fails with `TypstError::PackageNotFound { package }`,
+   naming exactly the missing package; download `package` and retry.
 
 ## Rebuilding
 
@@ -220,10 +226,12 @@ the Kotlin Gradle plugin is applied to the app module.
            "main.typ",
            sources
        );
+   } catch (TypstException.PackageNotFound e) {
+       // A transitive dependency listPackageImports couldn't see. e.getPackage()
+       // is the exact PackageRef to download — fetch it and retry the compile.
+       PackageRef pkg = e.getPackage();
    } catch (TypstException e) {
-       // e.getMessage() names the missing package if a transitive
-       // dependency wasn't caught by listPackageImports — fetch it and
-       // retry.
+       // e.getMessage() contains the Typst diagnostics
    }
    ```
 

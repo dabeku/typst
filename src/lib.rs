@@ -19,6 +19,11 @@ uniffi::setup_scaffolding!();
 pub enum TypstError {
     #[error("{reason}")]
     Compile { reason: String },
+    /// Compilation stopped because an `#import`/`#include`d package wasn't
+    /// present under `package_cache_dir` (or no `package_cache_dir` was
+    /// given). Download `package` and retry the compile.
+    #[error("package not found: @{}/{}:{}", package.namespace, package.name, package.version)]
+    PackageNotFound { package: PackageRef },
 }
 
 /// Fonts embedded in the binary via `typst-assets` (New Computer Modern,
@@ -69,6 +74,11 @@ struct TypstWorld {
     now: time::OffsetDateTime,
     source_cache: Mutex<HashMap<FileId, Source>>,
     resource_cache: Mutex<HashMap<FileId, FileResult<Bytes>>>,
+    /// The first package this compile discovered missing from
+    /// `package_cache_dir`, if any. Recorded here (rather than only as a
+    /// generic diagnostic message) so `compile_with` can report a
+    /// structured [`TypstError::PackageNotFound`] instead of just prose.
+    missing_package: Mutex<Option<PackageSpec>>,
 }
 
 impl TypstWorld {
@@ -91,6 +101,7 @@ impl TypstWorld {
             now: time::OffsetDateTime::now_utc(),
             source_cache: Mutex::new(HashMap::new()),
             resource_cache: Mutex::new(HashMap::new()),
+            missing_package: Mutex::new(None),
         }
     }
 
@@ -113,14 +124,14 @@ impl TypstWorld {
             VirtualRoot::Project => self.root.clone(),
             VirtualRoot::Package(spec) => {
                 let Some(cache_dir) = &self.package_cache_dir else {
-                    return Err(FileError::Package(PackageError::NotFound(spec.clone())));
+                    return Err(self.record_missing_package(spec));
                 };
                 let package_dir = cache_dir
                     .join(spec.namespace.as_str())
                     .join(spec.name.as_str())
                     .join(spec.version.to_string());
                 if !package_dir.is_dir() {
-                    return Err(FileError::Package(PackageError::NotFound(spec.clone())));
+                    return Err(self.record_missing_package(spec));
                 }
                 Some(package_dir)
             }
@@ -131,6 +142,14 @@ impl TypstWorld {
         let path = rooted.vpath().realize(&base)?;
         let bytes = std::fs::read(&path).map_err(|e| FileError::from_io(e, &path))?;
         Ok(Bytes::new(bytes))
+    }
+
+    /// Records `spec` as missing (if no package has been recorded missing
+    /// yet — the first one found is the one reported) and returns the
+    /// corresponding `FileError` to hand back to the caller.
+    fn record_missing_package(&self, spec: &PackageSpec) -> FileError {
+        self.missing_package.lock().unwrap().get_or_insert_with(|| spec.clone());
+        FileError::Package(PackageError::NotFound(spec.clone()))
     }
 }
 
@@ -199,10 +218,22 @@ fn format_diagnostics(diags: &[SourceDiagnostic]) -> String {
 fn compile_with(world: TypstWorld) -> Result<Vec<u8>, TypstError> {
     let document = typst::compile::<PagedDocument>(&world)
         .output
-        .map_err(|diags| TypstError::Compile { reason: format_diagnostics(&diags) })?;
+        .map_err(|diags| compile_error(&world, &diags))?;
 
     typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
         .map_err(|diags| TypstError::Compile { reason: format_diagnostics(&diags) })
+}
+
+/// Turns a failed compile into a `TypstError`. If the failure was (at least
+/// in part) caused by a package missing from `package_cache_dir`, that's
+/// reported as a structured [`TypstError::PackageNotFound`] — so the app can
+/// go download exactly that package — rather than just the joined prose of
+/// `diags`, which only carries a human-readable message.
+fn compile_error(world: &TypstWorld, diags: &[SourceDiagnostic]) -> TypstError {
+    if let Some(spec) = world.missing_package.lock().unwrap().take() {
+        return TypstError::PackageNotFound { package: spec.into() };
+    }
+    TypstError::Compile { reason: format_diagnostics(diags) }
 }
 
 /// Compiles a single, self-contained Typst source string into a PDF.
@@ -273,6 +304,16 @@ pub struct PackageRef {
     pub version: String,
 }
 
+impl From<PackageSpec> for PackageRef {
+    fn from(spec: PackageSpec) -> Self {
+        Self {
+            namespace: spec.namespace.to_string(),
+            name: spec.name.to_string(),
+            version: spec.version.to_string(),
+        }
+    }
+}
+
 /// Scans `sources`, starting at `main_path`, for `#import`/`#include` of
 /// `@namespace/name:version` package paths, following local (non-package)
 /// imports transitively as long as their targets are present in `sources`.
@@ -320,11 +361,7 @@ pub fn list_package_imports(
                     continue;
                 };
                 if seen_packages.insert(spec.clone()) {
-                    packages.push(PackageRef {
-                        namespace: spec.namespace.to_string(),
-                        name: spec.name.to_string(),
-                        version: spec.version.to_string(),
-                    });
+                    packages.push(spec.into());
                 }
             } else {
                 let base = vpath
@@ -372,14 +409,18 @@ mod tests {
     #[test]
     fn reports_syntax_errors() {
         let err = compile_to_pdf("#let x = ".to_string()).unwrap_err();
-        let TypstError::Compile { reason } = err;
+        let TypstError::Compile { reason } = err else {
+            panic!("expected TypstError::Compile, got {err:?}");
+        };
         assert!(!reason.is_empty());
     }
 
     #[test]
     fn standalone_compile_rejects_imports() {
         let err = compile_to_pdf("#import \"other.typ\": x".to_string()).unwrap_err();
-        let TypstError::Compile { reason } = err;
+        let TypstError::Compile { reason } = err else {
+            panic!("expected TypstError::Compile, got {err:?}");
+        };
         assert!(!reason.is_empty());
     }
 
@@ -451,7 +492,9 @@ mod tests {
             sources,
         )
         .unwrap_err();
-        let TypstError::Compile { reason } = err;
+        let TypstError::Compile { reason } = err else {
+            panic!("expected TypstError::Compile, got {err:?}");
+        };
         assert!(reason.contains("main_path"));
     }
 
@@ -471,8 +514,38 @@ mod tests {
             sources,
         )
         .unwrap_err();
-        let TypstError::Compile { reason } = err;
-        assert!(reason.contains("cetz"), "unexpected error: {reason}");
+        let TypstError::PackageNotFound { package } = err else {
+            panic!("expected TypstError::PackageNotFound, got {err:?}");
+        };
+        assert_eq!(
+            package,
+            PackageRef {
+                namespace: "preview".to_string(),
+                name: "cetz".to_string(),
+                version: "0.2.2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn project_compile_reports_missing_package_when_no_cache_dir_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = HashMap::from([(
+            "main.typ".to_string(),
+            "#import \"@preview/cetz:0.2.2\": canvas".to_string(),
+        )]);
+
+        let err = compile_project_to_pdf(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            "main.typ".to_string(),
+            sources,
+        )
+        .unwrap_err();
+        let TypstError::PackageNotFound { package } = err else {
+            panic!("expected TypstError::PackageNotFound, got {err:?}");
+        };
+        assert_eq!(package.name, "cetz");
     }
 
     #[test]

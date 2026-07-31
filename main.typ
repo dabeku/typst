@@ -1,4 +1,5 @@
 #import "template.typ": titlepage
+#import "@preview/simple-plot:1.0.0": plot
 
 #set page(
   paper: "a4",
@@ -35,3 +36,13 @@ Streaming platforms analyze viewing habits to recommend movies, television shows
 
 Financial institutions use AI to detect fraudulent transactions, while customer service departments employ chatbots that answer common questions around the clock. These examples demonstrate how AI quietly improves convenience and efficiency in everyday activities.
 
+#plot(
+  xmin: -1,
+  xmax: 5,
+  ymin: -1,
+  ymax: 26,
+
+  (
+    fn: x => x*x,
+  ),
+)

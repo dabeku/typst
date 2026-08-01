@@ -9,21 +9,55 @@ use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, SyntaxNode, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
-use typst::{Library, LibraryExt, World};
+use typst::{Library, LibraryExt, World, WorldExt};
 use typst_layout::PagedDocument;
 
 uniffi::setup_scaffolding!();
 
+/// A 1-indexed line/column location in a source file, for pointing an app's
+/// editor at exactly where a [`CompileDiagnostic`] applies. Indices are
+/// counted in characters, matching `typst-cli`'s own diagnostic output.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SourcePosition {
+    /// Path of the source file, relative to the project root (e.g.
+    /// `"main.typ"`, `"chapter.typ"`) or, for a diagnostic inside a package,
+    /// relative to that package's root.
+    pub path: String,
+    pub line: i32,
+    pub column: i32,
+}
+
+/// A single error or warning produced while compiling or exporting a Typst
+/// project, as reported by [`TypstError::Compile`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CompileDiagnostic {
+    pub message: String,
+    /// Where in the source this diagnostic applies. `None` for diagnostics
+    /// not tied to any file, e.g. an invalid path given by the caller
+    /// before compilation even starts.
+    pub position: Option<SourcePosition>,
+}
+
 /// Error returned to the app when a Typst source fails to compile or export.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum TypstError {
-    #[error("{reason}")]
-    Compile { reason: String },
+    #[error("{}", format_diagnostics(diagnostics))]
+    Compile { diagnostics: Vec<CompileDiagnostic> },
     /// Compilation stopped because an `#import`/`#include`d package wasn't
     /// present under `package_cache_dir` (or no `package_cache_dir` was
     /// given). Download `package` and retry the compile.
     #[error("package not found: @{}/{}:{}", package.namespace, package.name, package.version)]
     PackageNotFound { package: PackageRef },
+}
+
+impl TypstError {
+    /// A compile error not tied to any particular diagnostic — e.g. a bad
+    /// path given by the caller before compilation even starts.
+    fn compile(message: impl Into<String>) -> Self {
+        Self::Compile {
+            diagnostics: vec![CompileDiagnostic { message: message.into(), position: None }],
+        }
+    }
 }
 
 /// Fonts embedded in the binary via `typst-assets` (New Computer Modern,
@@ -62,9 +96,8 @@ fn load_project_fonts(dir: &std::path::Path) -> Vec<Font> {
 /// Interns a project-relative path (e.g. `"main.typ"`, `"chapter.typ"`,
 /// `"refs.bib"`) as a `FileId` rooted at the (virtual) project root.
 fn intern_path(path: &str) -> Result<FileId, TypstError> {
-    let vpath = VirtualPath::new(path).map_err(|e| TypstError::Compile {
-        reason: format!("invalid path {path:?}: {e}"),
-    })?;
+    let vpath = VirtualPath::new(path)
+        .map_err(|e| TypstError::compile(format!("invalid path {path:?}: {e}")))?;
     Ok(RootedPath::new(VirtualRoot::Project, vpath).intern())
 }
 
@@ -235,12 +268,47 @@ impl World for TypstWorld {
     }
 }
 
-fn format_diagnostics(diags: &[SourceDiagnostic]) -> String {
-    diags
+/// Renders diagnostics for [`TypstError::Compile`]'s `Display` impl, in
+/// `typst-cli`'s short diagnostic format (`path:line:column: message`), one
+/// per line. Diagnostics without a position (see [`CompileDiagnostic`]) are
+/// rendered as just the bare message.
+fn format_diagnostics(diagnostics: &[CompileDiagnostic]) -> String {
+    diagnostics
         .iter()
-        .map(|d| d.message.as_str())
+        .map(|d| match &d.position {
+            Some(pos) => format!("{}:{}:{}: {}", pos.path, pos.line, pos.column, d.message),
+            None => d.message.clone(),
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Resolves the source location of `span`, if it points into a file that's
+/// part of this compile. Line and column are 1-indexed, matching
+/// `typst-cli`'s diagnostic output.
+fn resolve_position(world: &TypstWorld, span: impl Into<typst::syntax::DiagSpan>) -> Option<SourcePosition> {
+    let span = span.into();
+    let id = span.id()?;
+    let range = world.range(span)?;
+    let source = world.source(id).ok()?;
+    let (line, column) = source.lines().byte_to_line_column(range.start)?;
+    Some(SourcePosition {
+        path: vpath_to_path_buf(id).to_string_lossy().into_owned(),
+        line: line as i32 + 1,
+        column: column as i32 + 1,
+    })
+}
+
+/// Converts raw `typst` diagnostics into [`CompileDiagnostic`]s, resolving
+/// each one's source position against `world`.
+fn to_compile_diagnostics(world: &TypstWorld, diags: &[SourceDiagnostic]) -> Vec<CompileDiagnostic> {
+    diags
+        .iter()
+        .map(|d| CompileDiagnostic {
+            message: d.message.to_string(),
+            position: resolve_position(world, d.span),
+        })
+        .collect()
 }
 
 /// How many compiles a `comemo` cache entry may go unused before eviction
@@ -263,7 +331,7 @@ fn compile_with(world: TypstWorld) -> Result<Vec<u8>, TypstError> {
     let document = output.map_err(|diags| compile_error(&world, &diags))?;
 
     typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
-        .map_err(|diags| TypstError::Compile { reason: format_diagnostics(&diags) })
+        .map_err(|diags| TypstError::Compile { diagnostics: to_compile_diagnostics(&world, &diags) })
 }
 
 /// Turns a failed compile into a `TypstError`. If the failure was (at least
@@ -275,7 +343,7 @@ fn compile_error(world: &TypstWorld, diags: &[SourceDiagnostic]) -> TypstError {
     if let Some(spec) = world.missing_package.lock().unwrap().take() {
         return TypstError::PackageNotFound { package: spec.into() };
     }
-    TypstError::Compile { reason: format_diagnostics(diags) }
+    TypstError::Compile { diagnostics: to_compile_diagnostics(world, diags) }
 }
 
 /// Compiles a Typst project into a PDF.
@@ -316,8 +384,8 @@ pub fn compile_project_to_pdf(
         }
         texts.insert(id, content);
     }
-    let main_id = main_id.ok_or_else(|| TypstError::Compile {
-        reason: format!("main_path {main_path:?} is missing from sources"),
+    let main_id = main_id.ok_or_else(|| {
+        TypstError::compile(format!("main_path {main_path:?} is missing from sources"))
     })?;
 
     let world = TypstWorld::new(
@@ -368,9 +436,8 @@ pub fn list_package_imports(
     main_path: String,
     sources: HashMap<String, String>,
 ) -> Result<Vec<PackageRef>, TypstError> {
-    let main_vpath = VirtualPath::new(&main_path).map_err(|e| TypstError::Compile {
-        reason: format!("invalid path {main_path:?}: {e}"),
-    })?;
+    let main_vpath = VirtualPath::new(&main_path)
+        .map_err(|e| TypstError::compile(format!("invalid path {main_path:?}: {e}")))?;
 
     let mut packages = Vec::new();
     let mut seen_packages = HashSet::new();
@@ -461,10 +528,13 @@ mod tests {
             sources,
         )
         .unwrap_err();
-        let TypstError::Compile { reason } = err else {
+        let TypstError::Compile { diagnostics } = err else {
             panic!("expected TypstError::Compile, got {err:?}");
         };
-        assert!(!reason.is_empty());
+        assert!(!diagnostics.is_empty());
+        let position = diagnostics[0].position.as_ref().expect("diagnostic should have a position");
+        assert_eq!(position.path, "main.typ");
+        assert_eq!(position.line, 1);
     }
 
     #[test]
@@ -498,10 +568,10 @@ mod tests {
             sources,
         )
         .unwrap_err();
-        let TypstError::Compile { reason } = err else {
+        let TypstError::Compile { diagnostics } = err else {
             panic!("expected TypstError::Compile, got {err:?}");
         };
-        assert!(!reason.is_empty());
+        assert!(!diagnostics.is_empty());
     }
 
     #[test]
@@ -572,10 +642,11 @@ mod tests {
             sources,
         )
         .unwrap_err();
-        let TypstError::Compile { reason } = err else {
+        let TypstError::Compile { diagnostics } = err else {
             panic!("expected TypstError::Compile, got {err:?}");
         };
-        assert!(reason.contains("main_path"));
+        assert!(diagnostics[0].position.is_none());
+        assert!(diagnostics[0].message.contains("main_path"));
     }
 
     #[test]

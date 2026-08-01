@@ -71,13 +71,31 @@ pub struct PackageRef {
 
 pub enum TypstError {
     /// Typst syntax/compile errors, PDF export errors, a missing/unreadable
-    /// image, or a `main_path` absent from `sources`. `reason` joins all
-    /// diagnostics with `\n`.
-    Compile { reason: String },
+    /// image, or a `main_path` absent from `sources`.
+    Compile { diagnostics: Vec<CompileDiagnostic> },
     /// Compilation needed a package that isn't present under
     /// `package_cache_dir` (or no `package_cache_dir` was given). `package`
     /// names exactly which one — download it and retry.
     PackageNotFound { package: PackageRef },
+}
+
+pub struct CompileDiagnostic {
+    pub message: String,
+    /// Where in the source this diagnostic applies. `None` for diagnostics
+    /// not tied to any file, e.g. an invalid path given by the caller
+    /// before compilation even starts.
+    pub position: Option<SourcePosition>,
+}
+
+pub struct SourcePosition {
+    /// Path of the source file, relative to the project root (e.g.
+    /// `"main.typ"`) or, for a diagnostic inside a package, relative to
+    /// that package's root.
+    pub path: String,
+    /// 1-indexed line number.
+    pub line: u32,
+    /// 1-indexed column number, in characters.
+    pub column: u32,
 }
 ```
 
@@ -182,13 +200,18 @@ the Kotlin Gradle plugin is applied to the app module.
    ```java
    import uniffi.typst_uniffi.Typst_uniffiKt;
    import uniffi.typst_uniffi.TypstException;
+   import uniffi.typst_uniffi.CompileDiagnostic;
 
    // Single file, no imports/images:
    try {
        byte[] pdf = Typst_uniffiKt.compileToPdf("= Hello\nWritten from *Typst*.");
        // e.g. write `pdf` to a file, or feed it to a PDF renderer
-   } catch (TypstException e) {
-       // e.getMessage() contains the Typst diagnostics
+   } catch (TypstException.Compile e) {
+       for (CompileDiagnostic d : e.getDiagnostics()) {
+           // d.getMessage(); d.getPosition() is null for diagnostics not
+           // tied to a file, otherwise has getPath()/getLine()/getColumn()
+           // (1-indexed) to point an editor at the exact spot.
+       }
    }
 
    // Multi-file project — logo.png must already be in projectDir; main.typ
@@ -204,8 +227,12 @@ the Kotlin Gradle plugin is applied to the app module.
            "main.typ",
            sources
        );
-   } catch (TypstException e) {
-       // e.getMessage() contains the Typst diagnostics
+   } catch (TypstException.Compile e) {
+       for (CompileDiagnostic d : e.getDiagnostics()) {
+           // d.getMessage(); d.getPosition() is null for diagnostics not
+           // tied to a file, otherwise has getPath()/getLine()/getColumn()
+           // (1-indexed) to point an editor at the exact spot.
+       }
    }
 
    // Project that imports a package — prefetch it into packageCacheDir
@@ -228,8 +255,12 @@ the Kotlin Gradle plugin is applied to the app module.
        // A transitive dependency listPackageImports couldn't see. e.getPackage()
        // is the exact PackageRef to download — fetch it and retry the compile.
        PackageRef pkg = e.getPackage();
-   } catch (TypstException e) {
-       // e.getMessage() contains the Typst diagnostics
+   } catch (TypstException.Compile e) {
+       for (CompileDiagnostic d : e.getDiagnostics()) {
+           // d.getMessage(); d.getPosition() is null for diagnostics not
+           // tied to a file, otherwise has getPath()/getLine()/getColumn()
+           // (1-indexed) to point an editor at the exact spot.
+       }
    }
    ```
 

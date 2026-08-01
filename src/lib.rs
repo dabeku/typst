@@ -34,6 +34,31 @@ static FONTS: LazyLock<Vec<Font>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Recursively scans `dir` for `.ttf`/`.otf`/`.ttc`/`.otc` files (e.g. a font
+/// dropped next to `main.typ`) and loads every face they contain, so
+/// `#set text(font: ...)` can reference project-supplied fonts and not just
+/// the embedded ones in [`FONTS`]. Unreadable or unparseable files are
+/// skipped rather than failing the whole compile — a font file the app
+/// doesn't end up needing shouldn't block compilation.
+fn load_project_fonts(dir: &std::path::Path) -> Vec<Font> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc")
+                })
+        })
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .flat_map(|data| Font::iter(Bytes::new(data)))
+        .collect()
+}
+
 /// Interns a project-relative path (e.g. `"main.typ"`, `"chapter.typ"`,
 /// `"refs.bib"`) as a `FileId` rooted at the (virtual) project root.
 fn intern_path(path: &str) -> Result<FileId, TypstError> {
@@ -88,7 +113,10 @@ impl TypstWorld {
         root: Option<PathBuf>,
         package_cache_dir: Option<PathBuf>,
     ) -> Self {
-        let fonts = FONTS.clone();
+        let mut fonts = FONTS.clone();
+        if let Some(dir) = &root {
+            fonts.extend(load_project_fonts(dir));
+        }
         let book = FontBook::from_fonts(&fonts);
         Self {
             library: LazyHash::new(Library::default()),
@@ -260,7 +288,9 @@ fn compile_error(world: &TypstWorld, diags: &[SourceDiagnostic]) -> TypstError {
 ///
 /// `root_dir` is only consulted for binary resources referenced by path but
 /// not present in `sources` — e.g. `#image("logo.png")` — which must exist
-/// there on disk.
+/// there on disk. `root_dir` is also recursively scanned for `.ttf`/`.otf`/
+/// `.ttc`/`.otc` font files, which are loaded alongside the embedded fonts
+/// and made available to `#set text(font: ...)`.
 ///
 /// `package_cache_dir`, if set, is where downloaded packages are expected to
 /// live, laid out as `{namespace}/{name}/{version}/...` (e.g.
@@ -435,6 +465,23 @@ mod tests {
             panic!("expected TypstError::Compile, got {err:?}");
         };
         assert!(!reason.is_empty());
+    }
+
+    #[test]
+    fn load_project_fonts_scans_root_dir_recursively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subdir = dir.path().join("fonts");
+        std::fs::create_dir(&subdir).unwrap();
+        // Real font bytes are needed for `Font::iter` to parse successfully;
+        // reuse one of the embedded assets rather than embedding a fixture.
+        let font_data = typst_assets::fonts().next().expect("embedded font asset");
+        std::fs::write(subdir.join("custom.otf"), font_data).unwrap();
+        // Non-font files must be ignored rather than failing the scan.
+        std::fs::write(dir.path().join("notes.txt"), b"not a font").unwrap();
+
+        let fonts = load_project_fonts(dir.path());
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts[0].data().as_slice(), font_data);
     }
 
     #[test]

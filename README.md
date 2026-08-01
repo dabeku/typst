@@ -43,8 +43,10 @@ statically linked into the `.so`, so the functions below work fully offline.
 /// unsaved editor buffers work as-is. `main_path` (e.g. "main.typ") must be
 /// a key in `sources`. `root_dir` on disk is only consulted for binary
 /// resources referenced by path but absent from `sources`, e.g.
-/// `#image("logo.png")`. `package_cache_dir`, if set, is where downloaded
-/// packages live (see "Package imports" below).
+/// `#image("logo.png")` — and is recursively scanned for `.ttf`/`.otf`/
+/// `.ttc`/`.otc` font files, loaded alongside the embedded fonts and made
+/// available to `#set text(font: ...)`. `package_cache_dir`, if set, is
+/// where downloaded packages live (see "Package imports" below).
 pub fn compile_project_to_pdf(
     root_dir: String,
     package_cache_dir: Option<String>,

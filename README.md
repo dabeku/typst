@@ -12,7 +12,10 @@ rustup target add \
  aarch64-linux-android \
  armv7-linux-androideabi \
  x86_64-linux-android \
- i686-linux-android
+ i686-linux-android \
+ aarch64-apple-ios \
+ aarch64-apple-ios-sim \
+ x86_64-apple-ios
 
 cargo install cargo-edit cargo-audit cargo-ndk
 
@@ -28,7 +31,7 @@ cargo set-version --version
 # typst_uniffi
 
 Compiles [Typst](https://typst.app) markup to a PDF from Rust, exposed to
-Android (Java/Kotlin) via [UniFFI](https://mozilla.github.io/uniffi-rs/).
+Android (Java/Kotlin) and iOS (Swift) via [UniFFI](https://mozilla.github.io/uniffi-rs/).
 
 The whole Typst compiler plus a set of embedded fonts (New Computer Modern,
 Libertinus Serif, DejaVu Sans Mono — same fonts `typst-cli` ships with) are
@@ -114,7 +117,7 @@ storing them; Rust only ever reads them back from disk. Workflow:
    every `@namespace/name:version` package the project directly imports or
    includes (following local `.typ` imports transitively). This is a
    static scan of literal import paths — it won't see dynamically computed
-   import paths, and it can't see a package's *own* dependencies (those are
+   import paths, and it can't see a package's _own_ dependencies (those are
    only knowable once that package is downloaded).
 2. For each `PackageRef` not already cached, download and unpack it into
    `package_cache_dir`, laid out as `{namespace}/{name}/{version}/...`
@@ -123,7 +126,7 @@ storing them; Rust only ever reads them back from disk. Workflow:
    fetched by downloading and untarring
    `https://packages.typst.org/{namespace}/{name}-{version}.tar.gz`.
 3. Call `compile_project_to_pdf(root_dir, Some(package_cache_dir), main_path,
-   sources)`. If a package the project needs still isn't present under
+sources)`. If a package the project needs still isn't present under
    `package_cache_dir` — including a transitive dependency step 1 couldn't
    see — compilation fails with `TypstError::PackageNotFound { package }`,
    naming exactly the missing package; download `package` and retry.
@@ -149,6 +152,19 @@ cargo run --bin uniffi-bindgen -- generate \
 Requires `cargo-ndk` (`cargo install cargo-ndk`) and the four Android Rust
 targets (`rustup target add aarch64-linux-android armv7-linux-androideabi
 x86_64-linux-android i686-linux-android`).
+
+```sh
+# builds the 3 iOS Rust targets, regenerates the Swift bindings, and packages
+# both into swift/Typst/TypstFFI.xcframework + swift/Typst/Sources/Typst ->
+# a local Swift Package
+./scripts/build-ios.sh
+```
+
+Requires Xcode command line tools and the three iOS Rust targets
+(`rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios`).
+`swift/Typst/` (the generated `TypstFFI.xcframework` and `Sources/Typst/`) is
+gitignored, same as `jniLibs/`/`bindings/` — run the script after cloning or
+after any Rust API change.
 
 ## Integrating into the Android app
 
@@ -267,3 +283,81 @@ the Kotlin Gradle plugin is applied to the app module.
 If you use `abiFilters`/App Bundles with per-ABI splits, Gradle picks the
 matching `.so` automatically at install time — no extra config needed beyond
 having all four directories present.
+
+## Integrating into the iOS app
+
+UniFFI generates native **Swift** bindings, packaged by `./scripts/build-ios.sh`
+into `swift/Typst/` as a local Swift Package (`TypstFFI.xcframework` — a fat
+static library for device (`arm64`) and simulator (`arm64` + `x86_64`) — plus
+the generated `Sources/Typst/typst_uniffi.swift`).
+
+1. **Add the local package** in Xcode: File → Add Package Dependencies... →
+   Add Local... → select `swift/Typst` (from this repo, e.g. as a git
+   submodule or copied in), then add the `Typst` library to your app target.
+
+2. **Call it from Swift.** Top-level UniFFI functions are free functions;
+   `TypstError` is a throwing `Swift.Error` enum:
+
+   ```swift
+   import Typst
+
+   // Single file, no imports/images:
+   do {
+       let pdf = try compileProjectToPdf(
+           rootDir: projectDir.path,
+           packageCacheDir: nil,
+           mainPath: "main.typ",
+           sources: ["main.typ": "= Hello\nWritten from *Typst*."]
+       )
+       // pdf: Data — e.g. write to a file, or feed to PDFKit
+   } catch let TypstError.Compile(diagnostics) {
+       for d in diagnostics {
+           // d.message; d.position is nil for diagnostics not tied to a
+           // file, otherwise has .path/.line/.column (1-indexed) to point
+           // an editor at the exact spot.
+       }
+   }
+
+   // Multi-file project — logo.png must already be in projectDir; main.typ
+   // and chapter.typ are passed directly and never touch disk.
+   do {
+       let sources = [
+           "main.typ": "#import \"chapter.typ\": greeting\n#greeting\n#image(\"logo.png\")",
+           "chapter.typ": "#let greeting = \"Hi from chapter\"",
+       ]
+       let pdf = try compileProjectToPdf(
+           rootDir: projectDir.path,
+           packageCacheDir: nil, // no packages used, so no package cache needed
+           mainPath: "main.typ",
+           sources: sources
+       )
+   } catch let TypstError.Compile(diagnostics) {
+       // ...
+   }
+
+   // Project that imports a package — prefetch it into packageCacheDir
+   // first (download+unpack is entirely the app's job), then compile.
+   do {
+       let sources = ["main.typ": "#import \"@preview/cetz:0.2.2\": canvas\ncanvas(...)"]
+
+       for pkg in try listPackageImports(mainPath: "main.typ", sources: sources) {
+           try ensurePackageDownloaded(packageCacheDir, pkg.namespace, pkg.name, pkg.version)
+       }
+
+       let pdf = try compileProjectToPdf(
+           rootDir: projectDir.path,
+           packageCacheDir: packageCacheDir.path,
+           mainPath: "main.typ",
+           sources: sources
+       )
+   } catch let TypstError.PackageNotFound(package) {
+       // A transitive dependency listPackageImports couldn't see. `package`
+       // is the exact PackageRef to download — fetch it and retry the compile.
+   } catch let TypstError.Compile(diagnostics) {
+       // ...
+   }
+   ```
+
+`TypstFFI.xcframework` already contains both a device and a (universal)
+simulator slice, so no per-platform config is needed beyond adding the
+package — Xcode picks the right slice for the active destination.

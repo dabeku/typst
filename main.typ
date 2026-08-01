@@ -6,6 +6,8 @@
   margin: 2cm,
 )
 
+#set text(font: "Matcha Mint")
+
 #show: titlepage
 
 = Introduction

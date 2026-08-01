@@ -295,6 +295,11 @@ the generated `Sources/Typst/typst_uniffi.swift`).
    Add Local... → select `swift/Typst` (from this repo, e.g. as a git
    submodule or copied in), then add the `Typst` library to your app target.
 
+   **Note:** The generated .a files (> 200MB) are not copied to the Xcode project
+   but they remain here. So when migrating to new MacBook keep in mind to
+   clone this project, execute build-ios.sh and set correct framework link
+   in Xcode project.
+
 2. **Call it from Swift.** Top-level UniFFI functions are free functions;
    `TypstError` is a throwing `Swift.Error` enum:
 

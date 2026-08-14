@@ -10,7 +10,7 @@
 
 #show: titlepage
 
-= Introduction2
+= Introduction
 
 #include "introduction.typ"
 
